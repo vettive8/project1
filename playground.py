@@ -2,6 +2,7 @@ import streamlit as st
 from dotenv import load_dotenv
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
+from langchain_community.callbacks import get_openai_callback
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
@@ -49,10 +50,18 @@ if run and question:
     )
 
     with st.spinner("Thinking..."):
-        answer = chain.invoke(question)
+        with get_openai_callback() as cb:
+            answer = chain.invoke(question)
 
     st.subheader("Answer")
     st.write(answer)
+
+    # ── Usage stats ───────────────────────────────────────────────────────────
+    st.divider()
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Prompt tokens", cb.prompt_tokens)
+    col2.metric("Completion tokens", cb.completion_tokens)
+    col3.metric("Cost", f"${cb.total_cost:.6f}")
 
 elif run and not question:
     st.warning("Enter a question first.")
