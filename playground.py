@@ -239,7 +239,6 @@ def build_viewer_html(html_content: str, source_docs: list) -> str:
         </div>"""
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/mark.js/8.11.1/mark.min.js"></script>
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
   body{{background:#0e1117;color:#fafafa;font-family:"Source Sans Pro",sans-serif;font-size:14px}}
@@ -275,20 +274,48 @@ def build_viewer_html(html_content: str, source_docs: list) -> str:
 </div>
 <script>
 var chunks = {chunks_json};
-var markIds = {{}};
 
+/* Build a map from each position in the whitespace-normalised string back
+   to the corresponding position in the original string.
+   e.g. "foo  bar" -> normText="foo bar", map=[0,1,2,3,5,6,7] */
+function buildNormMap(text) {{
+  var norm = '', map = [], prev = false;
+  for (var i = 0; i < text.length; i++) {{
+    var ws = /[\t\n\r ]/.test(text[i]);
+    if (ws) {{
+      if (!prev) {{ map.push(i); norm += ' '; prev = true; }}
+    }} else {{ map.push(i); norm += text[i]; prev = false; }}
+  }}
+  return {{text: norm, map: map}};
+}}
+
+/* Insert a <mark id="mark-N"> around the first match of needle in any
+   single text node within root. Whitespace is normalised on both sides
+   so newlines / collapsed spaces don't break the match. */
 function initHighlights() {{
-  var instance = new Mark(document.getElementById('docPanel'));
-  chunks.forEach(function(text, i) {{
-    // Normalize whitespace — DOM text node concatenation can vary
-    var searchText = text.replace(/\\s+/g, ' ').trim();
-    instance.mark(searchText, {{
-      acrossElements: true,
-      separateWordSearch: false,
-      each: function(el) {{
-        if (!markIds[i]) {{ markIds[i] = true; el.id = 'mark-' + i; }}
-      }}
-    }});
+  var panel = document.getElementById('docPanel');
+  chunks.forEach(function(rawText, i) {{
+    var needle = rawText.replace(/[\t\n\r ]+/g, ' ').trim();
+    if (needle.length < 8) return;
+    var tw = document.createTreeWalker(panel, NodeFilter.SHOW_TEXT, null, false);
+    var node;
+    while ((node = tw.nextNode())) {{
+      var nm = buildNormMap(node.textContent);
+      var pos = nm.text.indexOf(needle);
+      if (pos < 0) continue;
+      var start = nm.map[pos];
+      var endMapIdx = Math.min(pos + needle.length - 1, nm.map.length - 1);
+      var end   = nm.map[endMapIdx] + 1;
+      try {{
+        var range = document.createRange();
+        range.setStart(node, start);
+        range.setEnd(node, Math.min(end, node.textContent.length));
+        var mark = document.createElement('mark');
+        mark.id = 'mark-' + i;
+        range.surroundContents(mark);
+      }} catch(e) {{}}
+      break;
+    }}
   }});
 }}
 
@@ -296,15 +323,15 @@ function jumpTo(n) {{
   var m = document.getElementById('mark-' + n);
   if (m) {{
     m.scrollIntoView({{behavior:'smooth', block:'center'}});
-    document.querySelectorAll('mark').forEach(x => x.classList.remove('active-mark'));
+    document.querySelectorAll('mark').forEach(function(x) {{ x.classList.remove('active-mark'); }});
     m.classList.add('active-mark');
   }}
-  document.querySelectorAll('.source-card').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('.source-card').forEach(function(x) {{ x.classList.remove('active'); }});
   var c = document.getElementById('card-' + n);
   if (c) c.classList.add('active');
 }}
 
-window.onload = function() {{ initHighlights(); setTimeout(function(){{jumpTo(0);}}, 150); }};
+window.onload = function() {{ initHighlights(); setTimeout(function() {{ jumpTo(0); }}, 80); }};
 </script></body></html>"""
 
 # ── Session state: one-time init ──────────────────────────────────────────────
