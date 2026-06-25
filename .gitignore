@@ -3,6 +3,10 @@ venv/
 __pycache__/
 chroma_db/
 uploaded_docs/
+doc_registry.json
+history.json
+presets.json
+app_state.json
 Project Overview.docx
 Project Overview.md
 read.py
