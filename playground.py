@@ -275,47 +275,75 @@ def build_viewer_html(html_content: str, source_docs: list) -> str:
 <script>
 var chunks = {chunks_json};
 
-/* Build a map from each position in the whitespace-normalised string back
-   to the corresponding position in the original string.
-   e.g. "foo  bar" -> normText="foo bar", map=[0,1,2,3,5,6,7] */
-function buildNormMap(text) {{
-  var norm = '', map = [], prev = false;
+/* Collapse whitespace runs to a single space and record, for each position
+   in the normalised string, the corresponding position in the original. */
+function buildNorm(text) {{
+  var s = '', m = [], prev = false;
   for (var i = 0; i < text.length; i++) {{
-    var ws = /[\t\n\r ]/.test(text[i]);
-    if (ws) {{
-      if (!prev) {{ map.push(i); norm += ' '; prev = true; }}
-    }} else {{ map.push(i); norm += text[i]; prev = false; }}
+    var c = text[i];
+    var ws = (c === ' ' || c === '\\t' || c === '\\n' || c === '\\r');
+    if (ws) {{ if (!prev) {{ m.push(i); s += ' '; prev = true; }} }}
+    else    {{ m.push(i); s += c; prev = false; }}
   }}
-  return {{text: norm, map: map}};
+  return {{s: s, m: m}};
 }}
 
-/* Insert a <mark id="mark-N"> around the first match of needle in any
-   single text node within root. Whitespace is normalised on both sides
-   so newlines / collapsed spaces don't break the match. */
+/* Walk every text node in root, joining them into one string.
+   A space is injected before each block-level element so paragraph /
+   cell boundaries act as word separators when searching. */
+var BLK = {{P:1,H1:1,H2:1,H3:1,H4:1,H5:1,H6:1,LI:1,TR:1,TD:1,TH:1,DIV:1,PRE:1,BLOCKQUOTE:1}};
+function collectNodes(root) {{
+  var nodes=[], pos=[], cat='';
+  var tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
+  var n;
+  while ((n = tw.nextNode())) {{
+    if (cat.length > 0) {{
+      var tag = n.parentElement ? n.parentElement.tagName : '';
+      if (BLK[tag] && cat[cat.length-1] !== ' ') cat += ' ';
+    }}
+    pos.push(cat.length);
+    cat += n.textContent;
+    nodes.push(n);
+  }}
+  return {{nodes:nodes, pos:pos, cat:cat}};
+}}
+
+/* For each chunk, concatenate ALL text nodes, find the needle in the
+   full text, then mark the text node that contains the match start.
+   Nodes are re-collected after each insertion because the DOM changes. */
 function initHighlights() {{
   var panel = document.getElementById('docPanel');
   chunks.forEach(function(rawText, i) {{
-    var needle = rawText.replace(/[\t\n\r ]+/g, ' ').trim();
+    var needle = rawText.replace(/[\\t\\n\\r ]+/g, ' ').trim();
     if (needle.length < 8) return;
-    var tw = document.createTreeWalker(panel, NodeFilter.SHOW_TEXT, null, false);
-    var node;
-    while ((node = tw.nextNode())) {{
-      var nm = buildNormMap(node.textContent);
-      var pos = nm.text.indexOf(needle);
-      if (pos < 0) continue;
-      var start = nm.map[pos];
-      var endMapIdx = Math.min(pos + needle.length - 1, nm.map.length - 1);
-      var end   = nm.map[endMapIdx] + 1;
-      try {{
-        var range = document.createRange();
-        range.setStart(node, start);
-        range.setEnd(node, Math.min(end, node.textContent.length));
-        var mark = document.createElement('mark');
-        mark.id = 'mark-' + i;
-        range.surroundContents(mark);
-      }} catch(e) {{}}
-      break;
+
+    var col = collectNodes(panel);
+    var nm  = buildNorm(col.cat);
+    var p   = nm.s.indexOf(needle);
+    if (p < 0) return;
+
+    var origStart = nm.m[p];
+    var origEnd   = nm.m[Math.min(p + needle.length - 1, nm.m.length - 1)] + 1;
+
+    /* Find the text node that contains origStart */
+    var ni = col.nodes.length - 1;
+    for (var j = 0; j < col.nodes.length - 1; j++) {{
+      if (col.pos[j+1] > origStart) {{ ni = j; break; }}
     }}
+    var node = col.nodes[ni];
+    var ls = origStart - col.pos[ni];
+    var le = Math.min(origEnd - col.pos[ni], node.textContent.length);
+    if (ls < 0) ls = 0;
+    if (le <= ls) le = Math.min(ls + 60, node.textContent.length);
+
+    try {{
+      var r = document.createRange();
+      r.setStart(node, ls);
+      r.setEnd(node, le);
+      var mark = document.createElement('mark');
+      mark.id = 'mark-' + i;
+      r.surroundContents(mark);
+    }} catch(e) {{}}
   }});
 }}
 
