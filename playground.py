@@ -492,10 +492,12 @@ with st.sidebar:
     # ── Runs ──────────────────────────────────────────────────────────────────
     st.header("Runs")
     runs = []
-    for run_id in st.session_state.run_ids:
+    for position, run_id in enumerate(st.session_state.run_ids):
         with st.container(border=True):
             lc, bc = st.columns([5, 1])
-            lc.markdown(f"**Run {run_id + 1}**")
+            # Display number follows position (1, 2, 3…), not the internal
+            # run_id key — so deleting and re-adding renumbers cleanly.
+            lc.markdown(f"**Run {position + 1}**")
             if len(st.session_state.run_ids) > 1:
                 if bc.button("－", key=f"remove_{run_id}", use_container_width=True):
                     st.session_state.run_ids.remove(run_id)
