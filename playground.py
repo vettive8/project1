@@ -1,5 +1,6 @@
 import gc  # noqa: F401 (kept for potential future use)
 import html as _html
+import io
 import json
 import os
 import re
@@ -66,30 +67,58 @@ def load_registry():
     return load_json(REGISTRY_F, [])
 
 def save_app_state():
-    save_json(STATE_F, {"active_docs": st.session_state.get("active_docs", [])})
+    runs_data = [
+        {
+            "run_id": rid,
+            "model":  st.session_state.get(f"model_{rid}", MODELS[0]),
+            "mode":   st.session_state.get(f"mode_{rid}", "RAG"),
+            "prompt": st.session_state.get(f"prompt_{rid}", DEFAULT_PROMPT),
+        }
+        for rid in st.session_state.get("run_ids", [])
+    ]
+    save_json(STATE_F, {
+        "active_docs": st.session_state.get("active_docs", []),
+        "next_id":     st.session_state.get("next_id", 1),
+        "runs":        runs_data,
+    })
 
 # ── Converters ────────────────────────────────────────────────────────────────
-def convert_to_md(src_path: str) -> str:
-    """Convert DOCX / PDF / TXT to Markdown. Returns path to the .md file."""
-    base    = os.path.splitext(os.path.basename(src_path))[0]
-    md_path = os.path.join(UPLOAD_DIR, base + ".md")
-    ext     = os.path.splitext(src_path)[1].lower()
+def convert_to_md(src_path: str):
+    """Convert DOCX / PDF / TXT to Markdown + HTML for viewing.
+    Returns (md_path, html_path). MD is used for RAG chunking;
+    HTML is used for the document viewer (preserves tables, formatting)."""
+    base      = os.path.splitext(os.path.basename(src_path))[0]
+    md_path   = os.path.join(UPLOAD_DIR, base + ".md")
+    html_path = os.path.join(UPLOAD_DIR, base + ".html")
+    ext       = os.path.splitext(src_path)[1].lower()
 
     if ext == ".docx":
         with open(src_path, "rb") as f:
-            result = mammoth.convert_to_markdown(f)
-        with open(md_path, "w", encoding="utf-8") as f:
-            f.write(result.value)
-    elif ext == ".pdf":
-        md_text = pymupdf4llm.to_markdown(src_path)
+            raw = f.read()
+        md_text   = mammoth.convert_to_markdown(io.BytesIO(raw)).value
+        html_body = mammoth.convert_to_html(io.BytesIO(raw)).value
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(md_text)
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html_body)
+
+    elif ext == ".pdf":
+        md_text   = pymupdf4llm.to_markdown(src_path)
+        html_body = _md.markdown(md_text, extensions=["tables", "fenced_code"])
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(md_text)
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html_body)
+
     elif ext == ".txt":
         with open(src_path, "r", encoding="utf-8") as f:
             text = f.read()
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(text)
-    return md_path
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(f"<pre style='white-space:pre-wrap'>{_html.escape(text)}</pre>")
+
+    return md_path, html_path
 
 # ── ChromaDB helpers ──────────────────────────────────────────────────────────
 def collection_name_for(filename: str) -> str:
@@ -101,9 +130,9 @@ def collection_name_for(filename: str) -> str:
 
 def ingest_document(src_path: str, filename: str, status_obj) -> dict:
     """Convert → chunk → embed into a named collection. Returns a registry entry dict."""
-    status_obj.write("Converting to Markdown…")
-    md_path = convert_to_md(src_path)
-    status_obj.write(f"Saved `{os.path.basename(md_path)}`")
+    status_obj.write("Converting document…")
+    md_path, html_path = convert_to_md(src_path)
+    status_obj.write(f"Saved `{os.path.basename(md_path)}` + HTML viewer")
 
     with open(md_path, "r", encoding="utf-8") as f:
         md_text = f.read()
@@ -126,6 +155,7 @@ def ingest_document(src_path: str, filename: str, status_obj) -> dict:
         "filename":    filename,
         "collection":  col_name,
         "md_path":     md_path,
+        "html_path":   html_path,
         "chunks":      len(chunks),
         "ingested_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
@@ -151,7 +181,9 @@ def retrieve_docs(question: str, collection_names: list, k: int = 3) -> list:
         if key not in seen:
             seen.add(key)
             unique.append(doc)
-    return unique[: k * max(1, len(collection_names))]
+    # Always return the global top-k, not k-per-doc.
+    # If the answer only lives in one doc, all k chunks should come from there.
+    return unique[:k]
 
 # ── Text helpers ──────────────────────────────────────────────────────────────
 def format_docs(docs: list) -> str:
@@ -172,21 +204,12 @@ def load_full_text(active_entries: list) -> str:
     return "\n\n---\n\n".join(parts)
 
 # ── Document viewer ───────────────────────────────────────────────────────────
-def build_viewer_html(md_text: str, source_docs: list) -> str:
-    """Two-panel HTML: source cards on the left, full highlighted doc on the right."""
-    positions = []
-    for i, doc in enumerate(source_docs):
-        pos = md_text.find(doc.page_content)
-        if pos != -1:
-            positions.append((pos, i, doc.page_content))
-    positions.sort(key=lambda x: -x[0])
+def build_viewer_html(html_content: str, source_docs: list) -> str:
+    """Two-panel viewer: source cards left, full document right.
+    html_content is the rendered document body (from mammoth or markdown lib).
+    mark.js highlights the retrieved passages directly in the HTML DOM."""
+    chunks_json = json.dumps([doc.page_content for doc in source_docs])
 
-    marked = md_text
-    for pos, i, chunk in positions:
-        marked = (marked[:pos] + f'<mark id="mark-{i}">'
-                  + chunk + "</mark>" + marked[pos + len(chunk):])
-
-    doc_html   = _md.markdown(marked, extensions=["tables", "fenced_code"])
     cards_html = ""
     for i, doc in enumerate(source_docs):
         coll    = doc.metadata.get("_collection", "")
@@ -197,7 +220,9 @@ def build_viewer_html(md_text: str, source_docs: list) -> str:
             <div class="source-snippet">{snippet}…</div>
         </div>"""
 
-    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mark.js/8.11.1/mark.min.js"></script>
+<style>
   *{{box-sizing:border-box;margin:0;padding:0}}
   body{{background:#0e1117;color:#fafafa;font-family:"Source Sans Pro",sans-serif;font-size:14px}}
   .wrap{{display:flex;height:580px}}
@@ -215,47 +240,79 @@ def build_viewer_html(md_text: str, source_docs: list) -> str:
   .doc-panel ul,.doc-panel ol{{padding-left:1.5em;margin:.5em 0;color:#d8d8e8}}
   .doc-panel li{{margin:.25em 0;line-height:1.6}}
   .doc-panel table{{border-collapse:collapse;width:100%;margin:1em 0}}
-  .doc-panel td,.doc-panel th{{border:1px solid #2d2f3e;padding:6px 12px}}
-  .doc-panel th{{background:#1a1d2e;font-weight:600}}
+  .doc-panel td,.doc-panel th{{border:1px solid #3a3d50;padding:8px 14px;color:#d8d8e8}}
+  .doc-panel thead td,.doc-panel th{{background:#1a1d2e;font-weight:700;color:#fafafa}}
+  .doc-panel tr:nth-child(even){{background:#13151f}}
   .doc-panel code{{background:#1a1d2e;padding:2px 6px;border-radius:4px;font-size:13px}}
-  mark{{background:rgba(240,165,0,.28);border-bottom:2px solid #f0a500;
+  .doc-panel strong{{color:#fafafa}}
+  mark{{background:rgba(240,165,0,.3);border-bottom:2px solid #f0a500;
     color:inherit;border-radius:2px;padding:0 1px}}
-  mark.active-mark{{background:rgba(240,165,0,.5)}}
+  mark.active-mark{{background:rgba(240,165,0,.55)}}
 </style></head><body>
 <div class="wrap">
   <div class="sidebar">
     <div class="sidebar-title">RETRIEVED SOURCES</div>{cards_html}
   </div>
-  <div class="doc-panel">{doc_html}</div>
+  <div class="doc-panel" id="docPanel">{html_content}</div>
 </div>
 <script>
-function jumpTo(n){{
-  var m=document.getElementById('mark-'+n);
-  if(m){{m.scrollIntoView({{behavior:'smooth',block:'center'}});
-    document.querySelectorAll('mark').forEach(x=>x.classList.remove('active-mark'));
-    m.classList.add('active-mark');}}
-  document.querySelectorAll('.source-card').forEach(x=>x.classList.remove('active'));
-  var c=document.getElementById('card-'+n);if(c)c.classList.add('active');
+var chunks = {chunks_json};
+var markIds = {{}};
+
+function initHighlights() {{
+  var instance = new Mark(document.getElementById('docPanel'));
+  chunks.forEach(function(text, i) {{
+    instance.mark(text, {{
+      acrossElements: true,
+      separateWordSearch: false,
+      each: function(el) {{
+        if (!markIds[i]) {{ markIds[i] = true; el.id = 'mark-' + i; }}
+      }}
+    }});
+  }});
 }}
-window.onload=function(){{jumpTo(0);}};
+
+function jumpTo(n) {{
+  var m = document.getElementById('mark-' + n);
+  if (m) {{
+    m.scrollIntoView({{behavior:'smooth', block:'center'}});
+    document.querySelectorAll('mark').forEach(x => x.classList.remove('active-mark'));
+    m.classList.add('active-mark');
+  }}
+  document.querySelectorAll('.source-card').forEach(x => x.classList.remove('active'));
+  var c = document.getElementById('card-' + n);
+  if (c) c.classList.add('active');
+}}
+
+window.onload = function() {{ initHighlights(); setTimeout(function(){{jumpTo(0);}}, 150); }};
 </script></body></html>"""
 
 # ── Session state: one-time init ──────────────────────────────────────────────
 if "initialized" not in st.session_state:
     st.session_state.initialized = True
-    st.session_state.run_ids     = [0]
-    st.session_state.next_id     = 1
 
-    # Restore active doc selection from disk
     saved    = load_json(STATE_F, {})
     registry = load_registry()
-    valid    = {r["filename"] for r in registry}
-    initial  = [d for d in saved.get("active_docs", []) if d in valid]
-    st.session_state.active_docs = initial
 
-    # Pre-set checkbox widget keys so they restore correctly
+    # Restore active doc selection
+    valid   = {r["filename"] for r in registry}
+    initial = [d for d in saved.get("active_docs", []) if d in valid]
+    st.session_state.active_docs = initial
     for r in registry:
         st.session_state[f"doc_{r['collection']}"] = r["filename"] in initial
+
+    # Restore run configs (model / mode / prompt per run)
+    saved_runs = saved.get("runs", [])
+    if saved_runs:
+        st.session_state.run_ids = [r["run_id"] for r in saved_runs]
+        st.session_state.next_id = saved.get("next_id", max(r["run_id"] for r in saved_runs) + 1)
+        for r in saved_runs:
+            st.session_state[f"model_{r['run_id']}"]  = r.get("model",  MODELS[0])
+            st.session_state[f"mode_{r['run_id']}"]   = r.get("mode",   "RAG")
+            st.session_state[f"prompt_{r['run_id']}"] = r.get("prompt", DEFAULT_PROMPT)
+    else:
+        st.session_state.run_ids = [0]
+        st.session_state.next_id = 1
 
 # Apply "restore from history" if triggered (runs before sidebar renders checkboxes)
 if "restore_docs" in st.session_state:
@@ -383,6 +440,9 @@ with st.sidebar:
     else:
         st.caption("Maximum 8 runs reached.")
 
+# Save run configs after sidebar renders so all widget values are captured
+save_app_state()
+
 # ── Query form ────────────────────────────────────────────────────────────────
 components.html("""<script>
 (function(){
@@ -475,19 +535,33 @@ if run_button:
         st.write(answer)
 
         if source_docs:
-            if len(active_entries) == 1:
-                md_text = load_full_text(active_entries)
-                if md_text:
+            # Group chunks by which document they came from, then show a
+            # viewer per doc. If all chunks landed in one doc (common even
+            # when multiple docs are selected), only one viewer appears.
+            chunks_by_col = {}
+            for doc in source_docs:
+                col = doc.metadata.get("_collection", "")
+                chunks_by_col.setdefault(col, []).append(doc)
+
+            for col, col_docs in chunks_by_col.items():
+                entry = next((e for e in active_entries if e["collection"] == col), None)
+                if not entry:
+                    continue
+                # Prefer pre-rendered HTML (preserves tables); fall back to md→html
+                viewer_path = entry.get("html_path", "") or ""
+                if not viewer_path or not os.path.exists(viewer_path):
+                    viewer_path = entry.get("md_path", "")
+                    use_md = True
+                else:
+                    use_md = False
+                if viewer_path and os.path.exists(viewer_path):
+                    with open(viewer_path, encoding="utf-8") as f:
+                        raw = f.read()
+                    html_content = _md.markdown(raw, extensions=["tables", "fenced_code"]) if use_md else raw
+                    if len(chunks_by_col) > 1:
+                        st.caption(f"**{entry['filename']}**")
                     st.caption("Click a source card to jump to the highlighted passage.")
-                    components.html(build_viewer_html(md_text, source_docs), height=600, scrolling=False)
-            else:
-                with st.expander(f"Sources ({len(source_docs)} chunks from {len(active_entries)} docs)"):
-                    for j, doc in enumerate(source_docs):
-                        coll  = doc.metadata.get("_collection", "")
-                        fname = next((e["filename"] for e in active_entries if e["collection"] == coll), coll)
-                        st.markdown(f"**Source {j + 1}** · `{fname}`")
-                        st.text(doc.page_content)
-                        st.divider()
+                    components.html(build_viewer_html(html_content, col_docs), height=600, scrolling=False)
 
         col1, col2, col3 = st.columns(3)
         col1.metric("Prompt tokens",     cb.prompt_tokens)
@@ -518,9 +592,10 @@ if run_button:
         "docs":      [e["filename"] for e in active_entries],
         "question":  question,
         "runs":      run_results,
-        # Store md_paths so viewer can be rebuilt from history
+        # Store paths so viewer can be rebuilt from history
         "active_entries": [
-            {"filename": e["filename"], "md_path": e["md_path"]}
+            {"filename": e["filename"], "md_path": e["md_path"],
+             "html_path": e.get("html_path", "")}
             for e in active_entries
         ],
     })
@@ -542,20 +617,36 @@ elif "history_view" in st.session_state:
             st.markdown(f"**{r['label']}**")
             st.write(r["answer"])
 
-            # Rebuild the document viewer if this was a single-doc RAG run
+            # Rebuild the viewer — same grouped logic as the live run
             chunks = r.get("source_chunks", [])
-            if chunks and single_doc:
-                md_path = saved_entries[0].get("md_path", "")
-                if md_path and os.path.exists(md_path):
-                    with open(md_path, encoding="utf-8") as f:
-                        md_text = f.read()
-                    # Reconstruct minimal Document objects for the viewer
-                    rebuilt_docs = [
-                        Document(page_content=c["page_content"], metadata=c.get("metadata", {}))
-                        for c in chunks
-                    ]
-                    st.caption("Click a source card to jump to the highlighted passage.")
-                    components.html(build_viewer_html(md_text, rebuilt_docs), height=600, scrolling=False)
+            if chunks:
+                chunks_by_col = {}
+                for c in chunks:
+                    col = c.get("metadata", {}).get("_collection", "")
+                    chunks_by_col.setdefault(col, []).append(c)
+
+                for col, col_chunks in chunks_by_col.items():
+                    entry = next((e for e in saved_entries if e.get("collection") == col or col == ""), None)
+                    if not entry and saved_entries:
+                        entry = saved_entries[0]
+                    if not entry:
+                        continue
+                    viewer_path = entry.get("html_path", "") or ""
+                    if not viewer_path or not os.path.exists(viewer_path):
+                        viewer_path = entry.get("md_path", "")
+                        use_md = True
+                    else:
+                        use_md = False
+                    if viewer_path and os.path.exists(viewer_path):
+                        with open(viewer_path, encoding="utf-8") as f:
+                            raw = f.read()
+                        html_content = _md.markdown(raw, extensions=["tables", "fenced_code"]) if use_md else raw
+                        rebuilt = [Document(page_content=c["page_content"],
+                                            metadata=c.get("metadata", {})) for c in col_chunks]
+                        if len(chunks_by_col) > 1:
+                            st.caption(f"**{entry.get('filename', '')}**")
+                        st.caption("Click a source card to jump to the highlighted passage.")
+                        components.html(build_viewer_html(html_content, rebuilt), height=600, scrolling=False)
 
             c1, c2, c3 = st.columns(3)
             c1.metric("Prompt tokens",     r["prompt_tokens"])
