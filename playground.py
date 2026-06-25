@@ -83,10 +83,26 @@ def save_app_state():
     })
 
 # ── Converters ────────────────────────────────────────────────────────────────
+def html_body_to_text(html_body: str) -> str:
+    """Extract plain text from an HTML body fragment for RAG chunking.
+    Adds newlines at block boundaries so the resulting text mirrors what the
+    browser renders and what mark.js will find in the DOM text nodes."""
+    text = re.sub(r'<br\s*/?>', '\n', html_body, flags=re.I)
+    text = re.sub(r'</(p|h[1-6]|li|tr|blockquote)>', '\n', text, flags=re.I)
+    text = re.sub(r'<[^>]+>', '', text)          # strip all remaining tags
+    text = _html.unescape(text)                  # decode &amp; &lt; etc.
+    text = re.sub(r'[ \t]+', ' ', text)          # collapse horizontal whitespace
+    text = re.sub(r'[ \t]*\n[ \t]*', '\n', text) # clean line margins
+    text = re.sub(r'\n{3,}', '\n\n', text)       # max one blank line
+    return text.strip()
+
+
 def convert_to_md(src_path: str):
-    """Convert DOCX / PDF / TXT to Markdown + HTML for viewing.
-    Returns (md_path, html_path). MD is used for RAG chunking;
-    HTML is used for the document viewer (preserves tables, formatting)."""
+    """Convert DOCX / PDF / TXT to plain text + HTML for viewing.
+    Returns (md_path, html_path).
+    md_path stores plain text derived from the HTML body so chunk text
+    matches DOM text nodes and mark.js can highlight them.
+    html_path stores the rendered HTML used in the viewer."""
     base      = os.path.splitext(os.path.basename(src_path))[0]
     md_path   = os.path.join(UPLOAD_DIR, base + ".md")
     html_path = os.path.join(UPLOAD_DIR, base + ".html")
@@ -95,18 +111,20 @@ def convert_to_md(src_path: str):
     if ext == ".docx":
         with open(src_path, "rb") as f:
             raw = f.read()
-        md_text   = mammoth.convert_to_markdown(io.BytesIO(raw)).value
         html_body = mammoth.convert_to_html(io.BytesIO(raw)).value
+        # Derive plain text from HTML so chunks match the viewer's DOM text
+        plain_text = html_body_to_text(html_body)
         with open(md_path, "w", encoding="utf-8") as f:
-            f.write(md_text)
+            f.write(plain_text)
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(html_body)
 
     elif ext == ".pdf":
         md_text   = pymupdf4llm.to_markdown(src_path)
         html_body = _md.markdown(md_text, extensions=["tables", "fenced_code"])
+        plain_text = html_body_to_text(html_body)
         with open(md_path, "w", encoding="utf-8") as f:
-            f.write(md_text)
+            f.write(plain_text)
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(html_body)
 
@@ -262,7 +280,9 @@ var markIds = {{}};
 function initHighlights() {{
   var instance = new Mark(document.getElementById('docPanel'));
   chunks.forEach(function(text, i) {{
-    instance.mark(text, {{
+    // Normalize whitespace — DOM text node concatenation can vary
+    var searchText = text.replace(/\\s+/g, ' ').trim();
+    instance.mark(searchText, {{
       acrossElements: true,
       separateWordSearch: false,
       each: function(el) {{
