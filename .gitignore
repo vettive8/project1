@@ -1,0 +1,7 @@
+venv/
+.env
+__pycache__/
+chroma_db/
+Project Overview.docx
+Project Overview.md
+read.py
