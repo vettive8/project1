@@ -88,6 +88,9 @@ def html_body_to_text(html_body: str) -> str:
     Adds newlines at block boundaries so the resulting text mirrors what the
     browser renders and what mark.js will find in the DOM text nodes."""
     text = re.sub(r'<br\s*/?>', '\n', html_body, flags=re.I)
+    # Separate table cells with a space so they don't run together — the DOM
+    # viewer injects a space at the same boundaries, keeping chunks matchable.
+    text = re.sub(r'</(td|th)>', ' ', text, flags=re.I)
     text = re.sub(r'</(p|h[1-6]|li|tr|blockquote)>', '\n', text, flags=re.I)
     text = re.sub(r'<[^>]+>', '', text)          # strip all remaining tags
     text = _html.unescape(text)                  # decode &amp; &lt; etc.
